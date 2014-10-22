@@ -1,5 +1,5 @@
 
-package com.github.jucovschi.model;
+package com.github.jucovschi.model.snapshot;
 
 import java.util.List;
 

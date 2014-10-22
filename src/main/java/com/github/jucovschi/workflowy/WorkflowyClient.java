@@ -2,6 +2,8 @@ package com.github.jucovschi.workflowy;
 
 import java.io.UnsupportedEncodingException;
 import java.net.URLEncoder;
+import java.util.Date;
+import java.util.LinkedHashMap;
 
 import org.apache.camel.CamelContext;
 import org.apache.camel.Exchange;
@@ -13,7 +15,9 @@ import org.apache.camel.impl.DefaultCamelContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.github.jucovschi.model.TaskTree;
+import com.github.jucovschi.model.delta.Changeset;
+import com.github.jucovschi.model.snapshot.TaskTree;
+import com.github.jucovschi.workflowy.utils.UrlQueryString;
 
 public class WorkflowyClient extends RouteBuilder {
 	
@@ -21,8 +25,13 @@ public class WorkflowyClient extends RouteBuilder {
 	ProducerTemplate producer;
 	String cookie = null;
 	JacksonDataFormat snapshotFormat = new JacksonDataFormat(TaskTree.class);
+	JacksonDataFormat opFormat = new JacksonDataFormat(Changeset.class);
+	
+	String most_recent_operation_transaction_id;
+	int reqID;
 
 	public WorkflowyClient() {
+		reqID = 0;
 	}
 
 	public void start() throws Exception {
@@ -38,25 +47,26 @@ public class WorkflowyClient extends RouteBuilder {
 		producer.sendBody("direct:login", "username="+user+"&password="+password);
 	}
 	
+	public void sendOp(Changeset []changeSet) {
+		Object o = producer.requestBody("direct:sendOp", changeSet);
+	}
+	
+	public void getUpdates() {
+		Changeset ch = new Changeset();
+		ch.setMost_recent_operation_transaction_id(most_recent_operation_transaction_id);
+		sendOp(new Changeset[]{ch});
+	}
+	
 	public void setCookie(String cookie) {
 		this.cookie = cookie;
 	}
 	
 	public TaskTree getStatus() {
-		return producer.requestBody("direct:getStatus", "", TaskTree.class);
+		TaskTree result = producer.requestBody("direct:getStatus", "", TaskTree.class);
+		most_recent_operation_transaction_id = result.getProjectTreeData().getMainProjectTreeInfo().getInitialMostRecentOperationTransactionId();
+		return result;
 	}
 	
-	public static void main(String[] args) throws Exception {
-		WorkflowyClient client = new WorkflowyClient();
-		client.start();
-
-		client.login("someuser", "somepassword");
-		// or
-		client.setCookie("sessionid=somesession");
-
-		TaskTree tree = client.getStatus();		
-	}
-
 	Processor getCookies = new Processor() {
 		public void process(Exchange exchange) throws Exception {
 			cookie = exchange.getIn().getHeader("set-cookie", String.class);
@@ -67,6 +77,18 @@ public class WorkflowyClient extends RouteBuilder {
 	Processor setCookie = new Processor() {
 		public void process(Exchange exchange) throws Exception {
 			exchange.getIn().setHeader("cookie", cookie);
+		}
+	};
+	
+	Processor genDataRequest = new Processor() {
+		public void process(Exchange exchange) throws Exception {
+			LinkedHashMap<String, Object> data = new LinkedHashMap<String, Object>();
+			data.put("client_version", "14");
+			data.put("client_id", new Date().toGMTString());
+			data.put("push_poll_id", "T"+reqID);
+			data.put("push_poll_data", exchange.getIn().getBody(String.class));
+			
+			exchange.getIn().setBody(UrlQueryString.buildQueryString(data));
 		}
 	};
 	
@@ -82,5 +104,16 @@ public class WorkflowyClient extends RouteBuilder {
 			.process(setCookie)
 			.inOnly("https://workflowy.com/get_initialization_data?client_version=14")
 			.unmarshal(snapshotFormat);
+		
+		from("direct:sendOp")
+			.setHeader(Exchange.HTTP_METHOD, constant("POST"))
+			.setHeader(Exchange.CONTENT_TYPE, constant("application/x-www-form-urlencoded"))
+			.marshal(opFormat)
+			.process(genDataRequest)
+			.process(setCookie)
+			.to("log:sendPolling")
+			.inOut("https://workflowy.com/push_and_poll")
+			.convertBodyTo(String.class)
+			.to("log:polling?showHeaders");
 	}
 }
